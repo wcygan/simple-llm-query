@@ -1,14 +1,20 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use std::{error::Error, fs, path::Path};
+
 use clap::Parser;
-use futures::StreamExt;
+use futures::{StreamExt, pin_mut};
+use reqwest::{Client, Url};
 use serde::Serialize;
 use serde_json::Value;
-use std::error::Error;
-use std::fs;
 use tokio::io::{self, AsyncWriteExt};
+use tracing::{error, info};
+use async_trait::async_trait;
+use base64::Engine;
+use bytes::Bytes;
+
+// ------ CLI and Configuration ------
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
 struct Cli {
     /// The prompt to send to the LLM
     #[arg(short, long)]
@@ -21,12 +27,33 @@ struct Cli {
     /// Whether to perform a review step after the initial response
     #[arg(long)]
     review: bool,
+
+    /// LLM endpoint (overridden by --llm-endpoint)
+    #[arg(long, default_value = "http://localhost:8080/v1/chat/completions")]
+    llm_endpoint: String,
+}
+
+// ------ Domain Types ------
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ContentType {
+    Text,
+    ImageUrl,
 }
 
 #[derive(Serialize)]
 struct TextContent {
     #[serde(rename = "type")]
-    content_type: String,
+    content_type: ContentType,
     text: String,
 }
 
@@ -38,7 +65,7 @@ struct ImageUrl {
 #[derive(Serialize)]
 struct ImageContent {
     #[serde(rename = "type")]
-    content_type: String,
+    content_type: ContentType,
     image_url: ImageUrl,
 }
 
@@ -49,240 +76,227 @@ enum ContentPart {
     Image(ImageContent),
 }
 
-#[derive(Serialize)]
-struct MultimodalChatMessage {
-    role: String,
+struct ChatMessage {
+    role: Role,
     content: Vec<ContentPart>,
 }
 
-fn build_request_content(
-    prompt: &str,
-    image_path: Option<&str>,
-) -> Result<Vec<ContentPart>, Box<dyn Error + Send + Sync>> {
-    let mut content_parts = vec![ContentPart::Text(TextContent {
-        content_type: "text".into(),
-        text: prompt.into(),
-    })];
+impl ChatMessage {
+    fn new(role: Role, content: Vec<ContentPart>) -> Self {
+        Self { role, content }
+    }
+    fn user(content: Vec<ContentPart>) -> Self {
+        Self::new(Role::User, content)
+    }
+}
 
-    if let Some(path) = image_path {
-        println!("Reading and encoding image: {}", path);
-        let image_bytes = fs::read(path)?;
-        let encoded_image = BASE64_STANDARD.encode(&image_bytes);
+// ------ Chat Request Builder ------
 
-        let mime_type = match path.split('.').last() {
+struct ChatRequest {
+    stream: bool,
+    messages: Vec<ChatMessage>,
+}
+
+impl ChatRequest {
+    fn new() -> Self {
+        Self {
+            stream: false,
+            messages: vec![],
+        }
+    }
+
+    fn stream(mut self, s: bool) -> Self {
+        self.stream = s;
+        self
+    }
+
+    fn with_messages(mut self, msgs: Vec<ChatMessage>) -> Self {
+        self.messages = msgs;
+        self
+    }
+}
+
+// ------ Image Encoding Trait ------
+
+trait ImageEncoder {
+    fn encode_path(&self, path: &Path) -> Result<String, Box<dyn Error + Send + Sync>>;
+}
+
+struct DataUrlEncoder;
+
+impl ImageEncoder for DataUrlEncoder {
+    fn encode_path(&self, path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let bytes = fs::read(path)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mime = match path.extension().and_then(|s| s.to_str()) {
             Some("png") => "image/png",
             Some("jpg") | Some("jpeg") => "image/jpeg",
             Some("webp") => "image/webp",
             Some("gif") => "image/gif",
             _ => "application/octet-stream",
         };
-
-        let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
-
-        content_parts.push(ContentPart::Image(ImageContent {
-            content_type: "image_url".into(),
-            image_url: ImageUrl { url: data_url },
-        }));
+        Ok(format!("data:{};base64,{}", mime, encoded))
     }
-    Ok(content_parts)
 }
 
-async fn handle_and_capture_streamed_response(
-    response: reqwest::Response,
-    capture: bool,
-) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
-        eprintln!("Error response from server ({}): {}", status, text);
-        return Err(format!("Server returned error: {}", status).into());
+// ------ Content Builder ------
+
+fn build_request_content(
+    prompt: &str,
+    image_path: Option<&str>,
+    encoder: &dyn ImageEncoder,
+) -> Result<Vec<ContentPart>, Box<dyn Error + Send + Sync>> {
+    let mut parts = vec![ContentPart::Text(TextContent {
+        content_type: ContentType::Text,
+        text: prompt.to_string(),
+    })];
+    if let Some(path_str) = image_path {
+        let url = encoder.encode_path(Path::new(path_str))?;
+        parts.push(ContentPart::Image(ImageContent {
+            content_type: ContentType::ImageUrl,
+            image_url: ImageUrl { url },
+        }));
+    }
+    Ok(parts)
+}
+
+// ------ Transport Trait ------
+
+#[async_trait]
+trait LlmTransport {
+    async fn send(
+        &self,
+        endpoint: &Url,
+        request: &ChatRequest,
+    ) -> Result<impl futures::Stream<Item = Result<Bytes, reqwest::Error>>, Box<dyn Error + Send + Sync>>;
+}
+
+struct HttpTransport {
+    client: Client,
+}
+
+impl HttpTransport {
+    fn new() -> Self {
+        Self {
+            client: Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmTransport for HttpTransport {
+    async fn send(
+        &self,
+        endpoint: &Url,
+        request: &ChatRequest,
+    ) -> Result<impl futures::Stream<Item = Result<Bytes, reqwest::Error>>, Box<dyn Error + Send + Sync>> {
+        let body = serde_json::json!({
+            "stream": request.stream,
+            "messages": request.messages.iter().map(|m| {
+                serde_json::json!({
+                    "role": format!("{:?}", m.role).to_lowercase(),
+                    "content": m.content,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let resp = self
+            .client
+            .post(endpoint.clone())
+            .json(&body)
+            .send()
+            .await?;
+        Ok(resp.bytes_stream())
+    }
+}
+
+// ------ Client ------
+
+struct LlmClient<T: LlmTransport> {
+    transport: T,
+    endpoint: Url,
+}
+
+impl<T: LlmTransport> LlmClient<T> {
+    fn new(transport: T, endpoint: Url) -> Self {
+        Self { transport, endpoint }
     }
 
-    let mut stream = response.bytes_stream();
-    let mut buffer = Vec::new();
-    let mut handle = io::stdout();
-    let mut captured_response = if capture { Some(String::new()) } else { None };
+    async fn chat(
+        &self,
+        request: ChatRequest,
+        capture: bool,
+    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        let mut stream = self.transport.send(&self.endpoint, &request).await?;
+        pin_mut!(stream);
+        let mut buffer = Vec::new();
+        let mut captured = if capture { Some(String::new()) } else { None };
+        let mut stdout = io::stdout();
 
-    while let Some(item) = stream.next().await {
-        let chunk = item?;
-        buffer.extend_from_slice(&chunk);
-
-        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-            let event_data = buffer.drain(..pos + 2).collect::<Vec<u8>>();
-
-            if event_data.is_empty() || event_data == b"\n\n" || event_data.starts_with(b":") {
-                continue;
-            }
-
-            let text = String::from_utf8_lossy(&event_data);
-            for line in text.lines() {
-                if let Some(stripped) = line.strip_prefix("data: ") {
-                    if stripped.trim() == "[DONE]" {
-                        handle.write_all(b"\n").await?;
-                        handle.write_all(b"[stream closed]\n").await?;
-                        handle.flush().await?;
-                        return Ok(captured_response);
-                    }
-                    match serde_json::from_str::<Value>(stripped) {
-                        Ok(json) => {
-                            if let Some(delta) = json
-                                .pointer("/choices/0/delta/content")
-                                .and_then(Value::as_str)
-                            {
-                                handle.write_all(delta.as_bytes()).await?;
-                                handle.flush().await?;
-                                if let Some(ref mut captured) = captured_response {
-                                    captured.push_str(delta);
+        while let Some(item) = stream.next().await {
+            let chunk = item?;
+            buffer.extend_from_slice(&chunk);
+            while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                let data = buffer.drain(..pos + 2).collect::<Vec<_>>();
+                let text = String::from_utf8_lossy(&data);
+                for line in text.lines() {
+                    if let Some(stripped) = line.strip_prefix("data: ") {
+                        if stripped.trim() == "[DONE]" {
+                            stdout.write_all(b"\n").await?;
+                            return Ok(captured);
+                        }
+                        if let Ok(json) = serde_json::from_str::<Value>(stripped) {
+                            if let Some(delta) = json.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                                stdout.write_all(delta.as_bytes()).await?;
+                                stdout.flush().await?;
+                                if let Some(ref mut cap) = captured {
+                                    cap.push_str(delta);
                                 }
                             }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "\n[Warning: Failed to parse JSON chunk: '{}', Error: {}]\n",
-                                stripped, e
-                            );
                         }
                     }
                 }
             }
         }
+        Ok(captured)
     }
-
-    if !buffer.is_empty() {
-        eprintln!(
-            "\n[Warning: Stream ended unexpectedly. Remaining buffer: {:?}]\n",
-            String::from_utf8_lossy(&buffer)
-        );
-    } else {
-        eprintln!("\n[Warning: Stream ended without a final [DONE] message.]\n");
-    }
-
-    Ok(captured_response)
 }
 
-// Helper function to send request and handle response
-async fn send_llm_request(
-    client: &reqwest::Client,
-    url: &str,
-    messages: Vec<MultimodalChatMessage>,
-    capture_response: bool,
-    response_title: &str, // e.g., "Initial Response", "Review Response"
-) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
-    let body = serde_json::json!({
-        "stream": true,
-        "messages": messages,
-    });
-
-    // Print title before sending request
-    io::stdout()
-        .write_all(format!("\n--- {} ---\n", response_title).as_bytes())
-        .await?;
-    io::stdout().flush().await?;
-
-    println!("Sending request to {}", url);
-    let resp = client.post(url).json(&body).send().await?;
-
-    handle_and_capture_streamed_response(resp, capture_response).await
-}
+// ------ Main ------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    let url = "http://localhost:8080/v1/chat/completions";
-    let client = reqwest::Client::new();
+    let endpoint = Url::parse(&cli.llm_endpoint)?;
+    let client = LlmClient::new(HttpTransport::new(), endpoint);
+    let encoder = DataUrlEncoder;
 
-    // --- Initial Request ---
-    println!("Building initial request content...");
-    let initial_content = build_request_content(&cli.prompt, cli.image.as_deref())?;
-    let initial_messages = vec![MultimodalChatMessage {
-        role: "user".into(),
-        content: initial_content,
-    }];
+    info!("Building initial request content...");
+    let parts = build_request_content(&cli.prompt, cli.image.as_deref(), &encoder)?;
+    let initial_req = ChatRequest::new().stream(true).with_messages(vec![ChatMessage::user(parts)]);
 
-    let initial_response_result = send_llm_request(
-        &client,
-        url,
-        initial_messages,
-        cli.review, // Capture only if review flag is set
-        "LLM Response",
-    )
-    .await;
-
-    let first_response = match initial_response_result {
-        Ok(response_opt) => response_opt,
+    let first = match client.chat(initial_req, cli.review).await {
+        Ok(res) => res,
         Err(e) => {
-            eprintln!("Error during initial LLM request: {}", e);
+            error!("LLM request failed: {}", e);
             return Err(e);
         }
     };
 
-    // --- Review Request (if applicable) ---
     if cli.review {
-        if let Some(first_response_text) = first_response {
-            println!("\nBuilding review request content...");
-
-            let review_prompt_text = format!(
-                "Original prompt: \"{}\"\n\nFirst response: \"{}\"\n\nPlease review the first response based on the original prompt (and image, if provided below). Provide a final, potentially revised response.",
-                cli.prompt, first_response_text
+        if let Some(text) = first {
+            println!("");
+            info!("Building review request...");
+            let review_prompt = format!(
+                "Original prompt: \"{}\"\n\nFirst response: \"{}\"\n\nPlease review and revise.",
+                cli.prompt, text
             );
-
-            // Start building content for the review request
-            let mut review_content_parts = vec![ContentPart::Text(TextContent {
-                content_type: "text".into(),
-                text: review_prompt_text,
-            })];
-
-            // Re-add image if it was present in the initial request
-            if let Some(image_path) = cli.image.as_deref() {
-                println!("Re-encoding image for review request: {}", image_path);
-                // Need to re-read and encode the image for the review step
-                // (Could optimize by storing the data_url from the first step, but this is simpler for now)
-                let image_bytes = fs::read(image_path)?;
-                let encoded_image = BASE64_STANDARD.encode(&image_bytes);
-                let mime_type = match image_path.split('.').last() {
-                    Some("png") => "image/png",
-                    Some("jpg") | Some("jpeg") => "image/jpeg",
-                    Some("webp") => "image/webp",
-                    Some("gif") => "image/gif",
-                    _ => "application/octet-stream",
-                };
-                let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
-
-                review_content_parts.push(ContentPart::Image(ImageContent {
-                    content_type: "image_url".into(),
-                    image_url: ImageUrl { url: data_url },
-                }));
-            }
-
-            let review_messages = vec![MultimodalChatMessage {
-                role: "user".into(),
-                content: review_content_parts,
-            }];
-
-            // Send the review request (don't need to capture this response)
-            if let Err(e) = send_llm_request(
-                &client,
-                url,
-                review_messages,
-                false, // Don't capture review response
-                "Review Response",
-            )
-            .await
-            {
-                eprintln!("Error during review LLM request: {}", e);
-                // Decide if we should return Err here or just warn
-                return Err(e);
-            }
+            let review_parts = build_request_content(&review_prompt, cli.image.as_deref(), &encoder)?;
+            let review_req = ChatRequest::new().stream(true).with_messages(vec![ChatMessage::user(review_parts)]);
+            client.chat(review_req, false).await?;
         } else {
-            eprintln!(
-                "[Warning: Review step requested, but failed to capture the initial response.]"
-            );
-            // Potentially return an error here if capturing was essential
-            // For now, we just warn and continue (program finishes)
+            error!("No response captured for review step.");
         }
     }
 
