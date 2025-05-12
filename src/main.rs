@@ -1,6 +1,5 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures::StreamExt;
-use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use serde_json::Value;
 use std::error::Error;
@@ -138,10 +137,10 @@ async fn chat_with_image(
         ],
     }];
 
-    // build JSON body (note: stream is false for non-streaming multimodal in llama.cpp server)
+    // build JSON body - set stream to true
     let body = serde_json::json!({
         "model": model,
-        "stream": false, // llama.cpp server often doesn't support streaming multimodal yet
+        "stream": true, // Set to true for streaming response
         "messages": messages,
     });
 
@@ -156,29 +155,48 @@ async fn chat_with_image(
         return Err(format!("Server returned error: {}", status).into());
     }
 
-    let json: Value = resp.json().await?;
-    // Assuming the response structure is similar to OpenAI's chat completion for the content
-    if let Some(content) = json
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-    {
-        println!(
-            "
+    // --- Start Streaming Logic --- Modified from stream_chat
+    let mut stream = resp.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut handle = io::stdout();
 
-=== multimodal response ===
-{}",
-            content
-        );
-    } else {
-        println!(
-            "
+    handle.write_all(b"\n\n=== multimodal stream ===\n").await?;
 
-=== raw multimodal response ===
-{}",
-            json
-        ); // Print raw JSON if structure is unexpected
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        buffer.extend_from_slice(&chunk);
+
+        // split on "\n\n" which delimits SSE events
+        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+            let event = buffer.drain(..pos + 2).collect::<Vec<u8>>();
+            // Skip empty events or comment lines
+            if event.is_empty() || event.starts_with(b":") {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&event);
+            for line in text.lines() {
+                if let Some(stripped) = line.strip_prefix("data: ") {
+                    if stripped.trim() == "[DONE]" {
+                        handle.write_all(b"\n[stream closed]\n").await.unwrap();
+                        return Ok(());
+                    }
+                    // parse the JSON chunk
+                    if let Ok(json) = serde_json::from_str::<Value>(stripped) {
+                        if let Some(delta) = json
+                            .pointer("/choices/0/delta/content")
+                            .and_then(Value::as_str)
+                        {
+                            handle.write_all(delta.as_bytes()).await.unwrap();
+                            handle.flush().await.unwrap();
+                        }
+                    }
+                }
+            }
+        }
     }
+    // --- End Streaming Logic ---
 
+    // This part is now unreachable if the stream ends correctly with [DONE]
     Ok(())
 }
 
@@ -189,7 +207,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let model = "llava-v1.5-7b-Q4_K.gguf"; // Example multimodal model name
 
     // Define a simple text prompt
-    let text_prompt = "Describe this image";
+    let text_prompt = "Describe this image. Be succinct, and display calorie details in a JSON format. Do not reply with ANYTHING other than the JSON output. JSON keys are name, calories, protein, carbs, and fat. Combine the entire dish into one entry.";
 
     // Define simple text-only messages for the stream_chat case
     let text_messages = vec![ChatMessage {
