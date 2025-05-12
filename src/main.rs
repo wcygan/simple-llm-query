@@ -1,15 +1,22 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use clap::Parser;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use std::error::Error;
-use std::{env, fs};
+use std::fs;
 use tokio::io::{self, AsyncWriteExt};
 
-#[derive(Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// The prompt to send to the LLM
+    #[arg(short, long)]
+    prompt: String,
+
+    /// Optional path to an image file for multimodal input
+    #[arg(short, long)]
+    image: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -44,194 +51,134 @@ struct MultimodalChatMessage {
     content: Vec<ContentPart>,
 }
 
-async fn stream_chat(
-    client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    messages: &[ChatMessage],
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // build JSON body with stream:true
-    let body = serde_json::json!({
-        "model": model,
-        "stream": true,
-        "messages": messages,
-    });
+fn build_request_content(
+    prompt: &str,
+    image_path: Option<&str>,
+) -> Result<Vec<ContentPart>, Box<dyn Error + Send + Sync>> {
+    let mut content_parts = vec![ContentPart::Text(TextContent {
+        content_type: "text".into(),
+        text: prompt.into(),
+    })];
 
-    let resp = client.post(url).json(&body).send().await?;
-    let mut stream = resp.bytes_stream();
+    if let Some(path) = image_path {
+        println!("Reading and encoding image: {}", path);
+        let image_bytes = fs::read(path)?;
+        let encoded_image = BASE64_STANDARD.encode(&image_bytes);
 
-    // Accumulate partial chunks to handle SSE framing
-    let mut buffer = Vec::new();
-    let mut handle = io::stdout();
+        let mime_type = match path.split('.').last() {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            _ => "application/octet-stream",
+        };
 
-    while let Some(item) = stream.next().await {
-        let chunk = item?;
-        buffer.extend_from_slice(&chunk);
+        let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
 
-        // split on "\n\n" which delimits SSE events
-        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-            let event = buffer.drain(..pos + 2).collect::<Vec<u8>>();
-            // Skip empty events or comment lines
-            if event.is_empty() || event.starts_with(b":") {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&event);
-            for line in text.lines() {
-                if let Some(stripped) = line.strip_prefix("data: ") {
-                    if stripped.trim() == "[DONE]" {
-                        handle.write_all(b"\n[stream closed]\n").await.unwrap();
-                        return Ok(());
-                    }
-                    // parse the JSON chunk
-                    if let Ok(json) = serde_json::from_str::<Value>(stripped) {
-                        if let Some(delta) = json
-                            .pointer("/choices/0/delta/content")
-                            .and_then(Value::as_str)
-                        {
-                            handle.write_all(delta.as_bytes()).await.unwrap();
-                            handle.flush().await.unwrap();
-                        }
-                    }
-                }
-            }
-        }
+        content_parts.push(ContentPart::Image(ImageContent {
+            content_type: "image_url".into(),
+            image_url: ImageUrl { url: data_url },
+        }));
     }
-
-    Ok(())
+    Ok(content_parts)
 }
 
-async fn chat_with_image(
-    client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    prompt: &str,
-    image_path: &str,
+async fn handle_streamed_response(
+    response: reqwest::Response,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // read image bytes and base64 encode
-    let image_bytes = fs::read(image_path)?;
-    let encoded_image = BASE64_STANDARD.encode(&image_bytes);
-
-    // Determine mime type (basic inference based on extension)
-    let mime_type = match image_path.split('.').last() {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        _ => "application/octet-stream", // Default or consider erroring
-    };
-
-    let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
-
-    // Construct multimodal message payload
-    let messages = vec![MultimodalChatMessage {
-        role: "user".into(),
-        content: vec![
-            ContentPart::Text(TextContent {
-                content_type: "text".into(),
-                text: prompt.into(),
-            }),
-            ContentPart::Image(ImageContent {
-                content_type: "image_url".into(),
-                image_url: ImageUrl { url: data_url },
-            }),
-        ],
-    }];
-
-    // build JSON body - set stream to true
-    let body = serde_json::json!({
-        "model": model,
-        "stream": true, // Set to true for streaming response
-        "messages": messages,
-    });
-
-    // Send JSON request
-    let resp = client.post(url).json(&body).send().await?;
-
-    // Check for errors before parsing JSON
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
         eprintln!("Error response from server ({}): {}", status, text);
         return Err(format!("Server returned error: {}", status).into());
     }
 
-    // --- Start Streaming Logic --- Modified from stream_chat
-    let mut stream = resp.bytes_stream();
+    let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut handle = io::stdout();
 
-    handle.write_all(b"\n\n=== multimodal stream ===\n").await?;
+    handle.write_all(b"\n--- LLM Response ---\n").await?;
 
     while let Some(item) = stream.next().await {
         let chunk = item?;
         buffer.extend_from_slice(&chunk);
 
-        // split on "\n\n" which delimits SSE events
         while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-            let event = buffer.drain(..pos + 2).collect::<Vec<u8>>();
-            // Skip empty events or comment lines
-            if event.is_empty() || event.starts_with(b":") {
+            let event_data = buffer.drain(..pos + 2).collect::<Vec<u8>>();
+
+            if event_data.is_empty() || event_data == b"\n\n" || event_data.starts_with(b":") {
                 continue;
             }
-            let text = String::from_utf8_lossy(&event);
+
+            let text = String::from_utf8_lossy(&event_data);
             for line in text.lines() {
                 if let Some(stripped) = line.strip_prefix("data: ") {
                     if stripped.trim() == "[DONE]" {
-                        handle.write_all(b"\n[stream closed]\n").await.unwrap();
+                        handle.write_all(b"\n[stream closed]\n").await?;
+                        handle.flush().await?;
                         return Ok(());
                     }
-                    // parse the JSON chunk
-                    if let Ok(json) = serde_json::from_str::<Value>(stripped) {
-                        if let Some(delta) = json
-                            .pointer("/choices/0/delta/content")
-                            .and_then(Value::as_str)
-                        {
-                            handle.write_all(delta.as_bytes()).await.unwrap();
-                            handle.flush().await.unwrap();
+                    match serde_json::from_str::<Value>(stripped) {
+                        Ok(json) => {
+                            if let Some(delta) = json
+                                .pointer("/choices/0/delta/content")
+                                .and_then(Value::as_str)
+                            {
+                                handle.write_all(delta.as_bytes()).await?;
+                                handle.flush().await?;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "\n[Warning: Failed to parse JSON chunk: '{}', Error: {}]\n",
+                                stripped, e
+                            );
                         }
                     }
                 }
             }
         }
     }
-    // --- End Streaming Logic ---
 
-    // This part is now unreachable if the stream ends correctly with [DONE]
+    if !buffer.is_empty() {
+        eprintln!(
+            "\n[Warning: Stream ended unexpectedly. Remaining buffer: {:?}]\n",
+            String::from_utf8_lossy(&buffer)
+        );
+    } else {
+        eprintln!("\n[Warning: Stream ended without a final [DONE] message.]\n");
+    }
+
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // URL and model name
+    let cli = Cli::parse();
+
     let url = "http://localhost:8080/v1/chat/completions";
-    let model = "llava-v1.5-7b-Q4_K.gguf"; // Example multimodal model name
 
-    // Define a simple text prompt
-    let text_prompt = "Describe this image. Be succinct, and display calorie details in a JSON format. Do not reply with ANYTHING other than the JSON output. JSON keys are name, calories, protein, carbs, and fat. Combine the entire dish into one entry.";
+    let content = build_request_content(&cli.prompt, cli.image.as_deref())?;
 
-    // Define simple text-only messages for the stream_chat case
-    let text_messages = vec![ChatMessage {
+    let messages = vec![MultimodalChatMessage {
         role: "user".into(),
-        content: "Say hello in Hungarian".into(),
+        content,
     }];
+
+    let body = serde_json::json!({
+        "stream": true,
+        "messages": messages,
+    });
 
     let client = reqwest::Client::new();
 
-    // if an image path is passed as first arg, do multimodal
-    let args: Vec<String> = env::args().collect();
-    if args.len() > 1 {
-        let image_path = &args[1];
-        // Use the text_prompt for the multimodal request
-        println!(
-            "Sending image `{}` with prompt \"{}\" for multimodal inference...",
-            image_path, text_prompt
-        );
-        chat_with_image(&client, url, model, text_prompt, image_path).await?;
-    } else {
-        println!("Starting text stream...");
-        // Use text_messages for the text-only request
-        stream_chat(&client, url, model, &text_messages).await?;
-    }
+    println!("Sending request to {}", url);
+    let resp = client.post(url).json(&body).send().await?;
+
+    handle_streamed_response(resp).await?;
 
     Ok(())
 }
