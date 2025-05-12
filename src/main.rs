@@ -1,15 +1,48 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::StreamExt;
 use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use serde_json::Value;
+use std::error::Error;
 use std::{env, fs};
 use tokio::io::{self, AsyncWriteExt};
-use std::error::Error;
 
 #[derive(Serialize)]
 struct ChatMessage {
     role: String,
     content: String,
+}
+
+#[derive(Serialize)]
+struct TextContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct ImageContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    image_url: ImageUrl,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ContentPart {
+    Text(TextContent),
+    Image(ImageContent),
+}
+
+#[derive(Serialize)]
+struct MultimodalChatMessage {
+    role: String,
+    content: Vec<ContentPart>,
 }
 
 async fn stream_chat(
@@ -39,6 +72,10 @@ async fn stream_chat(
         // split on "\n\n" which delimits SSE events
         while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
             let event = buffer.drain(..pos + 2).collect::<Vec<u8>>();
+            // Skip empty events or comment lines
+            if event.is_empty() || event.starts_with(b":") {
+                continue;
+            }
             let text = String::from_utf8_lossy(&event);
             for line in text.lines() {
                 if let Some(stripped) = line.strip_prefix("data: ") {
@@ -68,28 +105,80 @@ async fn chat_with_image(
     client: &reqwest::Client,
     url: &str,
     model: &str,
-    messages: &[ChatMessage],
+    prompt: &str,
     image_path: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // read image bytes
+    // read image bytes and base64 encode
     let image_bytes = fs::read(image_path)?;
-    let messages_json = serde_json::to_string(messages).unwrap();
+    let encoded_image = BASE64_STANDARD.encode(&image_bytes);
 
-    // build multipart form
-    let form = Form::new()
-        .text("model", model.to_string())
-        .text("stream", "false")
-        .text("messages", messages_json)
-        .part(
-            "image_file",
-            Part::bytes(image_bytes)
-                .file_name("upload.png")
-                .mime_str("image/png")?,
-        );
+    // Determine mime type (basic inference based on extension)
+    let mime_type = match image_path.split('.').last() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream", // Default or consider erroring
+    };
 
-    let resp = client.post(url).multipart(form).send().await?;
+    let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
+
+    // Construct multimodal message payload
+    let messages = vec![MultimodalChatMessage {
+        role: "user".into(),
+        content: vec![
+            ContentPart::Text(TextContent {
+                content_type: "text".into(),
+                text: prompt.into(),
+            }),
+            ContentPart::Image(ImageContent {
+                content_type: "image_url".into(),
+                image_url: ImageUrl { url: data_url },
+            }),
+        ],
+    }];
+
+    // build JSON body (note: stream is false for non-streaming multimodal in llama.cpp server)
+    let body = serde_json::json!({
+        "model": model,
+        "stream": false, // llama.cpp server often doesn't support streaming multimodal yet
+        "messages": messages,
+    });
+
+    // Send JSON request
+    let resp = client.post(url).json(&body).send().await?;
+
+    // Check for errors before parsing JSON
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await?;
+        eprintln!("Error response from server ({}): {}", status, text);
+        return Err(format!("Server returned error: {}", status).into());
+    }
+
     let json: Value = resp.json().await?;
-    println!("\n\n=== multimodal response ===\n{}", json);
+    // Assuming the response structure is similar to OpenAI's chat completion for the content
+    if let Some(content) = json
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+    {
+        println!(
+            "
+
+=== multimodal response ===
+{}",
+            content
+        );
+    } else {
+        println!(
+            "
+
+=== raw multimodal response ===
+{}",
+            json
+        ); // Print raw JSON if structure is unexpected
+    }
+
     Ok(())
 }
 
@@ -97,10 +186,13 @@ async fn chat_with_image(
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // URL and model name
     let url = "http://localhost:8080/v1/chat/completions";
-    let model = "my-model.gguf";
+    let model = "llava-v1.5-7b-Q4_K.gguf"; // Example multimodal model name
 
-    // define a simple chat
-    let messages = vec![ChatMessage {
+    // Define a simple text prompt
+    let text_prompt = "Describe this image";
+
+    // Define simple text-only messages for the stream_chat case
+    let text_messages = vec![ChatMessage {
         role: "user".into(),
         content: "Say hello in Hungarian".into(),
     }];
@@ -111,11 +203,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         let image_path = &args[1];
-        println!("Sending image `{}` for multimodal inference...", image_path);
-        chat_with_image(&client, url, model, &messages, image_path).await?;
+        // Use the text_prompt for the multimodal request
+        println!(
+            "Sending image `{}` with prompt \"{}\" for multimodal inference...",
+            image_path, text_prompt
+        );
+        chat_with_image(&client, url, model, text_prompt, image_path).await?;
     } else {
         println!("Starting text stream...");
-        stream_chat(&client, url, model, &messages).await?;
+        // Use text_messages for the text-only request
+        stream_chat(&client, url, model, &text_messages).await?;
     }
 
     Ok(())
