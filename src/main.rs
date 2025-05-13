@@ -39,8 +39,6 @@ struct Cli {
 #[serde(rename_all = "lowercase")]
 enum Role {
     User,
-    Assistant,
-    System,
 }
 
 #[derive(Serialize)]
@@ -226,7 +224,7 @@ impl<T: LlmTransport> LlmClient<T> {
         request: ChatRequest,
         capture: bool,
     ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
-        let mut stream = self.transport.send(&self.endpoint, &request).await?;
+        let stream = self.transport.send(&self.endpoint, &request).await?;
         pin_mut!(stream);
         let mut buffer = Vec::new();
         let mut captured = if capture { Some(String::new()) } else { None };
@@ -286,7 +284,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     if cli.review {
         if let Some(text) = first {
-            println!("");
+            println!();
             info!("Building review request...");
             let review_prompt = format!(
                 "Original prompt: \"{}\"\n\nFirst response: \"{}\"\n\nPlease review and revise.",
