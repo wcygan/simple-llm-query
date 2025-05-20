@@ -1,5 +1,8 @@
 use std::{error::Error, fs, path::Path};
 
+use async_trait::async_trait;
+use base64::Engine;
+use bytes::Bytes;
 use clap::Parser;
 use futures::{StreamExt, pin_mut};
 use reqwest::{Client, Url};
@@ -7,9 +10,6 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{self, AsyncWriteExt};
 use tracing::{error, info};
-use async_trait::async_trait;
-use base64::Engine;
-use bytes::Bytes;
 
 // ------ CLI and Configuration ------
 
@@ -166,7 +166,10 @@ trait LlmTransport {
         &self,
         endpoint: &Url,
         request: &ChatRequest,
-    ) -> Result<impl futures::Stream<Item = Result<Bytes, reqwest::Error>>, Box<dyn Error + Send + Sync>>;
+    ) -> Result<
+        impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
+        Box<dyn Error + Send + Sync>,
+    >;
 }
 
 struct HttpTransport {
@@ -187,7 +190,10 @@ impl LlmTransport for HttpTransport {
         &self,
         endpoint: &Url,
         request: &ChatRequest,
-    ) -> Result<impl futures::Stream<Item = Result<Bytes, reqwest::Error>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let body = serde_json::json!({
             "stream": request.stream,
             "messages": request.messages.iter().map(|m| {
@@ -216,7 +222,10 @@ struct LlmClient<T: LlmTransport> {
 
 impl<T: LlmTransport> LlmClient<T> {
     fn new(transport: T, endpoint: Url) -> Self {
-        Self { transport, endpoint }
+        Self {
+            transport,
+            endpoint,
+        }
     }
 
     async fn chat(
@@ -243,7 +252,10 @@ impl<T: LlmTransport> LlmClient<T> {
                             return Ok(captured);
                         }
                         if let Ok(json) = serde_json::from_str::<Value>(stripped) {
-                            if let Some(delta) = json.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                            if let Some(delta) = json
+                                .pointer("/choices/0/delta/content")
+                                .and_then(Value::as_str)
+                            {
                                 stdout.write_all(delta.as_bytes()).await?;
                                 stdout.flush().await?;
                                 if let Some(ref mut cap) = captured {
@@ -272,7 +284,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     info!("Building initial request content...");
     let parts = build_request_content(&cli.prompt, cli.image.as_deref(), &encoder)?;
-    let initial_req = ChatRequest::new().stream(true).with_messages(vec![ChatMessage::user(parts)]);
+    let initial_req = ChatRequest::new()
+        .stream(true)
+        .with_messages(vec![ChatMessage::user(parts)]);
 
     let first = match client.chat(initial_req, cli.review).await {
         Ok(res) => res,
@@ -283,19 +297,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
 
     if cli.review {
-        if let Some(text) = first {
-            println!();
-            info!("Building review request...");
-            let review_prompt = format!(
-                "Original prompt: \"{}\"\n\nFirst response: \"{}\"\n\nPlease review and revise.",
-                cli.prompt, text
-            );
-            let review_parts = build_request_content(&review_prompt, cli.image.as_deref(), &encoder)?;
-            let review_req = ChatRequest::new().stream(true).with_messages(vec![ChatMessage::user(review_parts)]);
-            client.chat(review_req, false).await?;
-        } else {
+        let Some(text) = first else {
             error!("No response captured for review step.");
-        }
+            return Ok(());
+        };
+        println!();
+        info!("Building review request...");
+        let review_prompt = format!(
+            "Original prompt: \"{}\"\n\nFirst response: \"{}\"\n\nPlease review and revise.",
+            cli.prompt, text
+        );
+        let review_parts = build_request_content(&review_prompt, cli.image.as_deref(), &encoder)?;
+        let review_req = ChatRequest::new()
+            .stream(true)
+            .with_messages(vec![ChatMessage::user(review_parts)]);
+        client.chat(review_req, false).await?;
     }
 
     Ok(())
